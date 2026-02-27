@@ -1,350 +1,158 @@
 """
-Config-driven agent that wraps any deployed HTTP endpoint.
+User simulator powered by a LangChain-compatible model (e.g. Gemini wrapper).
 
-The endpoint is a black-box: it manages its own tools, conversation history,
-and session state internally. From tau2's perspective, this agent only
-sends and receives text messages.
-
-All endpoint-specific details (URL, payload shape, response parsing, headers)
-are driven by an `endpoint_config` dict — typically loaded from YAML.
+The policy/guidelines can be provided inline or as a path to a .md/.txt file,
+making this reusable across domains without code changes.
 
 Usage:
-    endpoint_config = {
-        "url": "https://your-endpoint.run.app",
-        "payload_template": {
-            "agent_id": "my-agent",
-            "session_id": "{{session_id}}",
-            "query": "{{query}}",
-        },
-        "response_content_key": "content",
-    }
-
-    agent = EndpointAgent(
-        tools=[],
-        domain_policy="",
-        endpoint_config=endpoint_config,
+    user = GeminiUserSimulator(
+        model=your_model,                   # any object with invoke()
+        instructions="Ask about pricing.",
+        policy="Be natural and helpful.",    # inline string or path to .md file
     )
 """
 
-import copy
-import uuid
-from typing import List, Optional
+import os
+from typing import Optional, Tuple
 
-import requests
 from loguru import logger
 
-from tau2.agent.base import LocalAgent, ValidAgentInputMessage
 from tau2.data_model.message import (
     AssistantMessage,
     Message,
     MultiToolMessage,
+    SystemMessage,
     UserMessage,
 )
-from tau2.data_model.tasks import Task
-from tau2.environment.tool import Tool
+from tau2.user.base import (
+    STOP,
+    TRANSFER,
+    OUT_OF_SCOPE,
+    BaseUser,
+    UserState,
+    ValidUserInputMessage,
+)
 
 
-# ============================================================
-# Template rendering helpers
-# ============================================================
-
-def render_template(value, variables: dict):
-    """Recursively render {{variable}} placeholders in a value."""
-    if isinstance(value, str):
-        result = value
-        for key, val in variables.items():
-            result = result.replace("{{" + key + "}}", str(val))
-        return result
-    elif isinstance(value, dict):
-        return {k: render_template(v, variables) for k, v in value.items()}
-    elif isinstance(value, list):
-        return [render_template(item, variables) for item in value]
-    return value
-
-
-def extract_by_dot_path(data: dict, dot_path: str):
+def _load_policy(policy: Optional[str]) -> str:
     """
-    Extract a value from a nested dict using dot-path notation.
-    e.g. "data.response.text" -> data["data"]["response"]["text"]
+    Resolve a policy value to its text content.
+
+    - None            -> empty string (no policy)
+    - file path       -> read from that file
+    - anything else   -> treat as inline policy string
     """
-    keys = dot_path.split(".")
-    current = data
-    for key in keys:
-        if isinstance(current, dict):
-            current = current.get(key)
-        else:
-            return None
-        if current is None:
-            return None
-    return current
+    if policy is None:
+        return ""
+
+    if os.path.isfile(policy):
+        with open(policy, "r") as fp:
+            return fp.read()
+
+    return policy
 
 
-# ============================================================
-# Agent state
-# ============================================================
-
-class EndpointAgentState:
-    """State for the endpoint agent — tracks session and conversation for tau2."""
-
-    def __init__(self, session_id: str, messages: list = None):
-        self.session_id = session_id
-        self.messages = messages or []
-        self.system_messages = []
-
-
-# ============================================================
-# Base endpoint agent
-# ============================================================
-
-class EndpointAgent(LocalAgent[EndpointAgentState]):
+class GeminiUserSimulator(BaseUser):
     """
-    Config-driven agent that calls any deployed HTTP endpoint.
+    User simulator that uses a LangChain-compatible model.
 
-    endpoint_config keys:
-        url (str):                    Endpoint URL (required)
-        payload_template (dict):      Request body template with {{query}}, {{session_id}} placeholders
-        response_content_key (str):   Dot-path to extract response text from JSON (default: "content")
-        method (str):                 HTTP method (default: "POST")
-        headers (dict):               HTTP headers (default: {})
-        timeout (int):                Request timeout in seconds (default: 120)
+    The model must have an `invoke()` method that accepts a list of
+    LangChain BaseMessage objects and returns a response with a `.content` attribute.
     """
-
-    STOP_TOKEN = "###STOP###"
 
     def __init__(
         self,
-        tools: List[Tool],
-        domain_policy: str,
-        endpoint_config: dict,
+        model=None,
+        tools=None,
+        instructions: Optional[str] = None,
+        policy: Optional[str] = None,
+        llm: Optional[str] = None,
+        llm_args: Optional[dict] = None,
     ):
-        super().__init__(tools=tools, domain_policy=domain_policy)
-        self.endpoint_config = endpoint_config
+        super().__init__(instructions=instructions, llm=llm, llm_args=llm_args)
+        self.model = model
+        self.tools = tools
+        self._policy = _load_policy(policy)
 
     @property
-    def _url(self) -> str:
-        return self.endpoint_config["url"]
-
-    @property
-    def _method(self) -> str:
-        return self.endpoint_config.get("method", "POST")
-
-    @property
-    def _headers(self) -> dict:
-        return self.endpoint_config.get("headers", {})
-
-    @property
-    def _timeout(self) -> int:
-        return self.endpoint_config.get("timeout", 120)
-
-    @property
-    def _payload_template(self) -> dict:
-        return self.endpoint_config.get("payload_template", {"query": "{{query}}"})
-
-    @property
-    def _response_content_key(self) -> str:
-        return self.endpoint_config.get("response_content_key", "content")
+    def system_prompt(self) -> str:
+        parts = []
+        if self._policy:
+            parts.append(self._policy)
+        parts.append(f"<scenario>\n{self.instructions}\n</scenario>")
+        return "\n\n".join(parts).strip()
 
     def get_init_state(
         self, message_history: Optional[list[Message]] = None
-    ) -> EndpointAgentState:
-        session_id = str(uuid.uuid4())
-        messages = message_history or []
-        return EndpointAgentState(session_id=session_id, messages=list(messages))
-
-    def generate_next_message(
-        self, message: ValidAgentInputMessage, state: EndpointAgentState
-    ) -> tuple[AssistantMessage, EndpointAgentState]:
-        if isinstance(message, MultiToolMessage):
-            state.messages.extend(message.tool_messages)
-            query = str(message.tool_messages[-1].content)
-        elif isinstance(message, UserMessage):
-            state.messages.append(message)
-            query = message.content
-        else:
-            state.messages.append(message)
-            query = str(message.content)
-
-        response_text = self._call_endpoint(
-            query=query,
-            session_id=state.session_id,
+    ) -> UserState:
+        if message_history is None:
+            message_history = []
+        return UserState(
+            system_messages=[SystemMessage(role="system", content=self.system_prompt)],
+            messages=list(message_history),
         )
 
-        assistant_message = AssistantMessage(
-            role="assistant",
+    @classmethod
+    def is_stop(cls, message: UserMessage) -> bool:
+        if message.is_tool_call():
+            return False
+        if message.content is None:
+            return False
+        return (
+            STOP in message.content
+            or TRANSFER in message.content
+            or OUT_OF_SCOPE in message.content
+        )
+
+    def generate_next_message(
+        self, message: ValidUserInputMessage, state: UserState
+    ) -> Tuple[UserMessage, UserState]:
+        if isinstance(message, MultiToolMessage):
+            state.messages.extend(message.tool_messages)
+        else:
+            state.messages.append(message)
+
+        langchain_messages = self._build_langchain_messages(state)
+
+        try:
+            response = self.model.invoke(langchain_messages)
+            response_text = response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            logger.error(f"Model invoke failed: {e}")
+            response_text = f"I'm having trouble responding. {STOP}"
+
+        user_message = UserMessage(
+            role="user",
             content=response_text,
             cost=0.0,
         )
-        state.messages.append(assistant_message)
-        return assistant_message, state
 
-    def _call_endpoint(self, query: str, session_id: str) -> str:
-        """Call the endpoint using the configured payload template and response parsing."""
-        variables = {
-            "query": query,
-            "session_id": session_id,
-        }
-        payload = render_template(copy.deepcopy(self._payload_template), variables)
+        state.messages.append(user_message)
+        return user_message, state
 
-        try:
-            response = requests.request(
-                method=self._method,
-                url=self._url,
-                json=payload,
-                headers=self._headers,
-                timeout=self._timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-            content = extract_by_dot_path(data, self._response_content_key)
-            if content is None:
-                logger.warning(
-                    f"Key '{self._response_content_key}' not found in response, "
-                    f"falling back to full response. Keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}"
-                )
-                return str(data)
-            return str(content)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Endpoint call failed: {e}")
-            return f"Error calling endpoint: {e}"
+    def _build_langchain_messages(self, state: UserState) -> list:
+        """
+        Convert tau2 state into LangChain message format.
 
-    @classmethod
-    def is_stop(cls, message: AssistantMessage) -> bool:
-        if message.content and cls.STOP_TOKEN in message.content:
-            return True
-        return False
+        Role-flipping: the user simulator sees agent messages as input (HumanMessage)
+        and its own previous messages as output (AIMessage).
+        """
+        from langchain_core.messages import SystemMessage as LCSystem
+        from langchain_core.messages import HumanMessage, AIMessage
+
+        lc_messages = []
+
+        for sys_msg in state.system_messages:
+            lc_messages.append(LCSystem(content=sys_msg.content))
+
+        for msg in state.messages:
+            if isinstance(msg, AssistantMessage):
+                if msg.content and not msg.is_tool_call():
+                    lc_messages.append(HumanMessage(content=msg.content))
+            elif isinstance(msg, UserMessage):
+                lc_messages.append(AIMessage(content=msg.content or ""))
+
+        return lc_messages
 
     def set_seed(self, seed: int):
         pass
-
-
-# ============================================================
-# No-User (Solo) variant
-# ============================================================
-
-class EndpointSoloAgent(EndpointAgent):
-    """
-    No-User ablation mode.
-    Sends the task ticket (question) directly to the endpoint.
-    No user interaction — one-shot Q&A.
-    """
-
-    def __init__(
-        self,
-        tools: List[Tool],
-        domain_policy: str,
-        task: Task,
-        endpoint_config: dict,
-    ):
-        super().__init__(
-            tools=tools,
-            domain_policy=domain_policy,
-            endpoint_config=endpoint_config,
-        )
-        self.task = task
-
-    @classmethod
-    def check_valid_task(cls, task: Task) -> bool:
-        return task.ticket is not None
-
-    def generate_next_message(
-        self, message: Optional[ValidAgentInputMessage], state: EndpointAgentState
-    ) -> tuple[AssistantMessage, EndpointAgentState]:
-        if message is None:
-            query = self.task.ticket
-        elif isinstance(message, UserMessage):
-            raise ValueError("Solo agent does not interact with users")
-        else:
-            if isinstance(message, MultiToolMessage):
-                state.messages.extend(message.tool_messages)
-            else:
-                state.messages.append(message)
-            query = str(message.content)
-
-        response_text = self._call_endpoint(
-            query=query,
-            session_id=state.session_id,
-        )
-
-        assistant_message = AssistantMessage(
-            role="assistant",
-            content=f"{response_text}\n{self.STOP_TOKEN}",
-            cost=0.0,
-        )
-        state.messages.append(assistant_message)
-        return assistant_message, state
-
-
-# ============================================================
-# Oracle Plan (GT) variant
-# ============================================================
-
-class EndpointGTAgent(EndpointAgent):
-    """
-    Oracle Plan ablation mode.
-    Augments the query with expected answer context using a configurable template,
-    reducing the agent's reasoning burden. Still interacts with user simulator.
-    """
-
-    DEFAULT_AUGMENTATION_TEMPLATE = (
-        "{{query}}\n\n"
-        "[Reference guidance - use this to inform your response]: {{expected_answer}}"
-    )
-
-    def __init__(
-        self,
-        tools: List[Tool],
-        domain_policy: str,
-        task: Task,
-        endpoint_config: dict,
-        augmentation_template: Optional[str] = None,
-    ):
-        super().__init__(
-            tools=tools,
-            domain_policy=domain_policy,
-            endpoint_config=endpoint_config,
-        )
-        self.task = task
-        self.expected_answer = self._extract_expected_answer()
-        self.augmentation_template = augmentation_template or self.DEFAULT_AUGMENTATION_TEMPLATE
-
-    @classmethod
-    def check_valid_task(cls, task: Task) -> bool:
-        return task.ticket is not None
-
-    def _extract_expected_answer(self) -> str:
-        if hasattr(self.task, "expected_answer"):
-            return self.task.expected_answer
-        if self.task.evaluation_criteria and self.task.evaluation_criteria.actions:
-            return str(self.task.evaluation_criteria.actions)
-        return ""
-
-    def generate_next_message(
-        self, message: ValidAgentInputMessage, state: EndpointAgentState
-    ) -> tuple[AssistantMessage, EndpointAgentState]:
-        if isinstance(message, MultiToolMessage):
-            state.messages.extend(message.tool_messages)
-            query = str(message.tool_messages[-1].content)
-        elif isinstance(message, UserMessage):
-            state.messages.append(message)
-            query = message.content
-        else:
-            state.messages.append(message)
-            query = str(message.content)
-
-        augmented_query = render_template(self.augmentation_template, {
-            "query": query,
-            "expected_answer": self.expected_answer,
-        })
-
-        response_text = self._call_endpoint(
-            query=augmented_query,
-            session_id=state.session_id,
-        )
-
-        assistant_message = AssistantMessage(
-            role="assistant",
-            content=response_text,
-            cost=0.0,
-        )
-        state.messages.append(assistant_message)
-        return assistant_message, state
