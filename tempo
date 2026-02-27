@@ -1,30 +1,22 @@
 """
-Config-driven evaluation harness for deployed agents.
+Convert CSV/Excel Q&A pairs into tau2-bench tasks.json format.
 
-Reuses tau2-bench's native data structures and pass@k metric computation:
-  - SimulationRun, Results, RewardInfo from tau2.data_model.simulation
-  - compute_metrics() and ConsoleDisplay from tau2.metrics / tau2.utils
-  - Each task is run `num_trials` times, scored by LLM judge, then
-    pass@k = C(successes, k) / C(num_trials, k) per task, averaged.
-
-For any new agent endpoint evaluation, write a YAML config file — zero code changes.
-The only function you need to edit is `create_user_model()` to instantiate YOUR
-specific LangChain-compatible model.
+Reads your data file, creates Task objects with NL assertion-based evaluation,
+and writes them to data/tau2/domains/{domain}/tasks.json — the same structure
+used by airline, retail, and telecom domains.
 
 Usage:
-    python evaluate.py --config eval_config.yaml
-    python evaluate.py --config eval_config.yaml --mode no_user --num-trials 4
-    python evaluate.py --config eval_config.yaml --mode all --num-tasks 5
+    python prepare_tasks.py --config eval_config.yaml
 
-See eval_config.example.yaml for a fully commented config template.
+    # Override data path or domain:
+    python prepare_tasks.py --config eval_config.yaml --data my_qa.csv --domain mobility
+
+After running this, your tasks are loadable via tau2's standard registry,
+and evaluate.py can use run_tasks() directly.
 """
 
 import argparse
 import json
-import random
-import time
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -33,53 +25,23 @@ import yaml
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from eval_harness.endpoint_agent import EndpointAgent, render_template
-from eval_harness.gemini_user import GeminiUserSimulator
-
-# tau2 data models — reuse native structures
-from tau2.data_model.message import AssistantMessage
-from tau2.data_model.simulation import (
-    AgentInfo,
-    Info,
-    RewardInfo,
-    Results,
-    SimulationRun,
-    TerminationReason,
-    UserInfo,
-)
+from eval_harness.endpoint_agent import render_template
 from tau2.data_model.tasks import (
     EvaluationCriteria,
     RewardType,
     Task,
     UserScenario,
 )
-from tau2.environment.environment import Environment, EnvironmentInfo
-
-# tau2 metrics — reuse pass@k computation
-from tau2.metrics.agent_metrics import compute_metrics
-
-# tau2 display — reuse console display
-from tau2.utils.display import ConsoleDisplay
-
-from tau2.orchestrator.orchestrator import Orchestrator
+from tau2.utils.utils import DATA_DIR
 
 
 # ============================================================
-# 1. CONFIG SCHEMA
+# Config (reuse the same YAML schema as evaluate.py)
 # ============================================================
-
-class EndpointConfig(BaseModel):
-    url: str
-    method: str = "POST"
-    headers: dict = Field(default_factory=dict)
-    timeout: int = 120
-    payload_template: dict = Field(default_factory=lambda: {"query": "{{query}}"})
-    response_content_key: str = "content"
-
 
 class DataConfig(BaseModel):
     path: str
-    format: str = "excel"  # "excel" or "csv"
+    format: str = "excel"
     columns: dict = Field(default_factory=lambda: {
         "question": "question",
         "expected_answer": "expected_answer",
@@ -89,7 +51,6 @@ class DataConfig(BaseModel):
 
 
 class UserSimulatorConfig(BaseModel):
-    policy: Optional[str] = None  # inline string or path to .md file
     persona_template: str = "A customer contacting {{domain}} service."
     instructions_template: str = (
         "Ask the following question: {{question}}\n"
@@ -98,44 +59,24 @@ class UserSimulatorConfig(BaseModel):
     )
 
 
-class EvaluationConfig(BaseModel):
-    modes: list[str] = Field(default_factory=lambda: ["no_user"])
-    num_trials: int = 1
-    max_steps: int = 20
-    pass_threshold: float = 0.5
-    output: str = "evaluation_results.json"
-    num_tasks: Optional[int] = None
-    seed: int = 42
-
-
-class OraclePlanConfig(BaseModel):
-    augmentation_template: str = (
-        "{{query}}\n\n"
-        "[Reference guidance - use this to inform your response]: {{expected_answer}}"
-    )
-
-
-class EvalConfig(BaseModel):
+class PrepareConfig(BaseModel):
     domain: str = "default"
-    endpoint: EndpointConfig
     data: DataConfig
     user_simulator: UserSimulatorConfig = Field(default_factory=UserSimulatorConfig)
-    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
-    oracle_plan: OraclePlanConfig = Field(default_factory=OraclePlanConfig)
 
 
-def load_config(config_path: str) -> EvalConfig:
+def load_config(config_path: str) -> PrepareConfig:
     with open(config_path, "r") as f:
         raw = yaml.safe_load(f)
-    return EvalConfig(**raw)
+    return PrepareConfig(**raw)
 
 
 # ============================================================
-# 2. LOAD TASKS FROM DATA FILE
+# Convert data to tasks
 # ============================================================
 
-def load_tasks(config: EvalConfig) -> list[tuple[Task, str]]:
-    """Load Q&A pairs from Excel/CSV and convert to (Task, expected_answer) tuples."""
+def convert_to_tasks(config: PrepareConfig) -> list[Task]:
+    """Load Q&A pairs and convert to tau2 Task objects."""
     data_cfg = config.data
     col_map = data_cfg.columns
 
@@ -160,8 +101,11 @@ def load_tasks(config: EvalConfig) -> list[tuple[Task, str]]:
     for idx, row in df.iterrows():
         question = str(row[question_col]).strip()
         expected_answer = str(row[answer_col]).strip()
-
-        task_id = str(row[task_id_col]).strip() if task_id_col and task_id_col in df.columns else f"{config.domain}_{idx}"
+        task_id = (
+            str(row[task_id_col]).strip()
+            if task_id_col and task_id_col in df.columns
+            else f"{config.domain}_{idx}"
+        )
 
         template_vars = {
             "question": question,
@@ -189,440 +133,61 @@ def load_tasks(config: EvalConfig) -> list[tuple[Task, str]]:
                 reward_basis=[RewardType.NL_ASSERTION],
             ),
         )
-        tasks.append((task, expected_answer))
+        tasks.append(task)
 
-    logger.info(f"Loaded {len(tasks)} tasks from {data_cfg.path}")
     return tasks
 
 
 # ============================================================
-# 3. RUN MODES — returns (messages, termination_reason, agent_response)
+# Write tasks to tau2 data directory
 # ============================================================
 
-def _endpoint_dict(config: EvalConfig) -> dict:
-    """Convert EndpointConfig to the dict expected by EndpointAgent."""
-    return config.endpoint.model_dump()
+def save_tasks(tasks: list[Task], domain: str) -> Path:
+    """Save tasks to data/tau2/domains/{domain}/tasks.json."""
+    domain_dir = DATA_DIR / "tau2" / "domains" / domain
+    domain_dir.mkdir(parents=True, exist_ok=True)
 
+    tasks_path = domain_dir / "tasks.json"
+    with open(tasks_path, "w") as f:
+        json.dump([t.model_dump() for t in tasks], f, indent=2)
 
-def run_no_user(task: Task, expected_answer: str, config: EvalConfig) -> dict:
-    """No-User mode: question sent directly to endpoint, one-shot Q&A."""
-    agent = EndpointAgent(
-        tools=[],
-        domain_policy="",
-        task=task,
-        endpoint_config=_endpoint_dict(config),
-        mode="no_user",
-        expected_answer=expected_answer,
-    )
-    state = agent.get_init_state()
-    response_msg, state = agent.generate_next_message(None, state)
-    agent_response = response_msg.content.replace(EndpointAgent.STOP_TOKEN, "").strip()
-
-    return {
-        "agent_response": agent_response,
-        "messages": [response_msg],
-        "termination_reason": TerminationReason.AGENT_STOP,
-    }
-
-
-def run_default(task: Task, expected_answer: str, config: EvalConfig, user_model, max_steps: int) -> dict:
-    """Default mode: agent and user simulator have a multi-turn conversation."""
-    agent = EndpointAgent(
-        tools=[],
-        domain_policy="",
-        endpoint_config=_endpoint_dict(config),
-    )
-    user = GeminiUserSimulator(
-        model=user_model,
-        instructions=str(task.user_scenario),
-        policy=config.user_simulator.policy,
-    )
-    environment = Environment(
-        domain_name=config.domain,
-        policy="",
-        tools=None,
-        user_tools=None,
-    )
-
-    orchestrator = Orchestrator(
-        domain=config.domain,
-        agent=agent,
-        user=user,
-        environment=environment,
-        task=task,
-        max_steps=max_steps,
-        max_errors=5,
-        solo_mode=False,
-    )
-    simulation = orchestrator.run()
-
-    agent_responses = [
-        msg.content for msg in simulation.messages
-        if isinstance(msg, AssistantMessage) and msg.content
-    ]
-
-    return {
-        "agent_response": "\n".join(agent_responses),
-        "messages": list(simulation.messages),
-        "termination_reason": simulation.termination_reason,
-    }
-
-
-def run_oracle_plan(task: Task, expected_answer: str, config: EvalConfig, user_model, max_steps: int) -> dict:
-    """Oracle Plan mode: agent gets expected answer as guidance, still talks to user."""
-    agent = EndpointAgent(
-        tools=[],
-        domain_policy="",
-        task=task,
-        endpoint_config=_endpoint_dict(config),
-        mode="oracle_plan",
-        expected_answer=expected_answer,
-        augmentation_template=config.oracle_plan.augmentation_template,
-    )
-    user = GeminiUserSimulator(
-        model=user_model,
-        instructions=str(task.user_scenario),
-        policy=config.user_simulator.policy,
-    )
-    environment = Environment(
-        domain_name=config.domain,
-        policy="",
-        tools=None,
-        user_tools=None,
-    )
-
-    orchestrator = Orchestrator(
-        domain=config.domain,
-        agent=agent,
-        user=user,
-        environment=environment,
-        task=task,
-        max_steps=max_steps,
-        max_errors=5,
-        solo_mode=False,
-    )
-    simulation = orchestrator.run()
-
-    agent_responses = [
-        msg.content for msg in simulation.messages
-        if isinstance(msg, AssistantMessage) and msg.content
-    ]
-
-    return {
-        "agent_response": "\n".join(agent_responses),
-        "messages": list(simulation.messages),
-        "termination_reason": simulation.termination_reason,
-    }
+    return tasks_path
 
 
 # ============================================================
-# 4. EVALUATION (LLM-as-Judge → reward for tau2)
-# ============================================================
-
-def evaluate_response(
-    question: str,
-    expected_answer: str,
-    agent_response: str,
-    judge_model,
-) -> dict:
-    """Use the model as a judge to score agent response vs expected answer.
-
-    Returns a dict with "score" (0.0–1.0) and "reasoning".
-    The score is used as the `reward` in tau2's RewardInfo.
-    """
-    from langchain_core.messages import HumanMessage
-
-    judge_prompt = f"""You are an evaluation judge. Compare the agent's response against
-the expected answer for the given question.
-
-Question: {question}
-
-Expected Answer: {expected_answer}
-
-Agent's Response: {agent_response}
-
-Evaluate on these criteria:
-1. Correctness: Does the response contain the key information from the expected answer?
-2. Completeness: Does the response cover all important points?
-3. Relevance: Is the response on-topic and helpful?
-
-Respond in this exact JSON format:
-{{"score": <float 0.0 to 1.0>, "reasoning": "<brief explanation>"}}
-
-Only output the JSON, nothing else."""
-
-    try:
-        response = judge_model.invoke([HumanMessage(content=judge_prompt)])
-        result_text = response.content if hasattr(response, "content") else str(response)
-        result_text = result_text.strip()
-        if result_text.startswith("```"):
-            result_text = result_text.split("```")[1]
-            if result_text.startswith("json"):
-                result_text = result_text[4:]
-        result = json.loads(result_text)
-        return {
-            "score": float(result.get("score", 0.0)),
-            "reasoning": result.get("reasoning", ""),
-        }
-    except Exception as e:
-        logger.error(f"Judge evaluation failed: {e}")
-        return {"score": 0.0, "reasoning": f"Evaluation error: {e}"}
-
-
-# ============================================================
-# 5. MODEL FACTORY — EDIT THIS FOR YOUR SETUP
-# ============================================================
-
-def create_user_model():
-    """
-    Create your LangChain-compatible model instance.
-
-    This is the ONLY function you need to edit when switching environments.
-    The model must have an `invoke(messages)` method returning an object
-    with a `.content` attribute.
-
-    Examples:
-        # LangChain Google GenAI
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-
-        # LangChain OpenAI
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model="gpt-4o")
-
-        # Your custom wrapper (must have .invoke() returning obj with .content)
-        from your_module import YourModel
-        return YourModel(...)
-    """
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-
-
-# ============================================================
-# 6. BUILD TAU2 RESULTS OBJECT
-# ============================================================
-
-def _get_git_commit() -> str:
-    """Get current git commit hash, or a placeholder."""
-    try:
-        import subprocess
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
-        ).decode().strip()
-    except Exception:
-        return "unknown"
-
-
-def build_results(
-    simulations: list[SimulationRun],
-    tasks: list[Task],
-    config: EvalConfig,
-) -> Results:
-    """Wrap simulation runs into tau2's native Results object."""
-    info = Info(
-        git_commit=_get_git_commit(),
-        num_trials=config.evaluation.num_trials,
-        max_steps=config.evaluation.max_steps,
-        max_errors=5,
-        user_info=UserInfo(implementation="gemini_user_simulator"),
-        agent_info=AgentInfo(implementation="endpoint_agent"),
-        environment_info=EnvironmentInfo(
-            domain_name=config.domain,
-            policy="",
-        ),
-        seed=config.evaluation.seed,
-    )
-    return Results(
-        info=info,
-        tasks=tasks,
-        simulations=simulations,
-    )
-
-
-# ============================================================
-# 7. MAIN
+# Main
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Config-driven evaluation harness for deployed agents"
+        description="Convert CSV/Excel Q&A pairs to tau2-bench tasks.json"
     )
     parser.add_argument("--config", required=True, help="Path to YAML config file")
-    parser.add_argument("--mode", default=None, help="Override evaluation mode(s): no_user, default, oracle_plan, all")
-    parser.add_argument("--num-tasks", type=int, default=None, help="Override number of tasks")
-    parser.add_argument("--num-trials", type=int, default=None, help="Override number of trials per task (for pass@k)")
-    parser.add_argument("--output", default=None, help="Override output file path")
-    parser.add_argument("--seed", type=int, default=None, help="Override random seed")
+    parser.add_argument("--data", default=None, help="Override data file path")
+    parser.add_argument("--domain", default=None, help="Override domain name")
+    parser.add_argument("--output", default=None, help="Override output path (default: data/tau2/domains/{domain}/tasks.json)")
     args = parser.parse_args()
 
     config = load_config(args.config)
 
-    # Apply CLI overrides
-    if args.mode:
-        config.evaluation.modes = [args.mode] if args.mode != "all" else ["no_user", "default", "oracle_plan"]
-    if args.num_tasks is not None:
-        config.evaluation.num_tasks = args.num_tasks
-    if args.num_trials is not None:
-        config.evaluation.num_trials = args.num_trials
+    if args.data:
+        config.data.path = args.data
+    if args.domain:
+        config.domain = args.domain
+
+    tasks = convert_to_tasks(config)
+    logger.info(f"Converted {len(tasks)} tasks from {config.data.path}")
+
     if args.output:
-        config.evaluation.output = args.output
-    if args.seed is not None:
-        config.evaluation.seed = args.seed
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w") as f:
+            json.dump([t.model_dump() for t in tasks], f, indent=2)
+    else:
+        output_path = save_tasks(tasks, config.domain)
 
-    # Expand "all" mode
-    modes = config.evaluation.modes
-    if "all" in modes:
-        modes = ["no_user", "default", "oracle_plan"]
-
-    num_trials = config.evaluation.num_trials
-    pass_threshold = config.evaluation.pass_threshold
-
-    # Generate seeds for each trial (deterministic from master seed)
-    rng = random.Random(config.evaluation.seed)
-    trial_seeds = [rng.randint(0, 1_000_000) for _ in range(num_trials)]
-
-    # Load tasks
-    task_pairs = load_tasks(config)
-    if config.evaluation.num_tasks:
-        task_pairs = task_pairs[:config.evaluation.num_tasks]
-
-    # Extract Task objects for Results
-    all_tasks = [task for task, _ in task_pairs]
-
-    # Create model (for user simulator and judge)
-    user_model = create_user_model()
-
-    logger.info(f"Configuration: {len(task_pairs)} tasks x {num_trials} trials, pass_threshold={pass_threshold}")
-
-    all_mode_results = {}
-    for mode in modes:
-        logger.info(f"\n{'='*60}\nRunning mode: {mode} ({num_trials} trial(s) per task)\n{'='*60}")
-        simulations: list[SimulationRun] = []
-
-        for trial in range(num_trials):
-            logger.info(f"\n--- Trial {trial + 1}/{num_trials} (seed={trial_seeds[trial]}) ---")
-
-            for i, (task, expected_answer) in enumerate(task_pairs):
-                logger.info(f"[{mode}] Trial {trial+1}/{num_trials} | Task {i+1}/{len(task_pairs)}: {task.id}")
-                start_time = datetime.now(timezone.utc)
-                start_ts = time.time()
-
-                try:
-                    if mode == "no_user":
-                        run_result = run_no_user(task, expected_answer, config)
-                    elif mode == "default":
-                        run_result = run_default(task, expected_answer, config, user_model, config.evaluation.max_steps)
-                    elif mode == "oracle_plan":
-                        run_result = run_oracle_plan(task, expected_answer, config, user_model, config.evaluation.max_steps)
-                    else:
-                        raise ValueError(f"Unknown mode: {mode}")
-
-                    # Score with LLM judge
-                    eval_result = evaluate_response(
-                        question=task.ticket,
-                        expected_answer=expected_answer,
-                        agent_response=run_result["agent_response"],
-                        judge_model=user_model,
-                    )
-                    reward = eval_result["score"]
-
-                    end_time = datetime.now(timezone.utc)
-                    duration = time.time() - start_ts
-
-                    # Build tau2 SimulationRun
-                    sim = SimulationRun(
-                        id=str(uuid.uuid4()),
-                        task_id=task.id,
-                        start_time=start_time.isoformat(),
-                        end_time=end_time.isoformat(),
-                        duration=duration,
-                        termination_reason=run_result["termination_reason"],
-                        agent_cost=0.0,
-                        user_cost=0.0,
-                        reward_info=RewardInfo(
-                            reward=reward,
-                            info={
-                                "reasoning": eval_result["reasoning"],
-                                "expected_answer": expected_answer,
-                                "agent_response": run_result["agent_response"],
-                            },
-                        ),
-                        messages=run_result["messages"],
-                        trial=trial,
-                        seed=trial_seeds[trial],
-                    )
-                    simulations.append(sim)
-
-                    logger.info(
-                        f"  Reward: {reward:.2f} | "
-                        f"Msgs: {len(run_result['messages'])} | "
-                        f"Time: {duration:.1f}s"
-                    )
-
-                except Exception as e:
-                    logger.error(f"  Failed: {e}")
-                    end_time = datetime.now(timezone.utc)
-                    duration = time.time() - start_ts
-
-                    # Record failed trial with reward=0
-                    sim = SimulationRun(
-                        id=str(uuid.uuid4()),
-                        task_id=task.id,
-                        start_time=start_time.isoformat(),
-                        end_time=end_time.isoformat(),
-                        duration=duration,
-                        termination_reason=TerminationReason.AGENT_ERROR,
-                        agent_cost=0.0,
-                        user_cost=0.0,
-                        reward_info=RewardInfo(
-                            reward=0.0,
-                            info={"error": str(e)},
-                        ),
-                        messages=[],
-                        trial=trial,
-                        seed=trial_seeds[trial],
-                    )
-                    simulations.append(sim)
-
-        # Build tau2 Results and compute metrics
-        results = build_results(simulations, all_tasks, config)
-        metrics = compute_metrics(results)
-
-        # Display using tau2's built-in display
-        logger.info(f"\n--- {mode} Metrics ---")
-        ConsoleDisplay.display_agent_metrics(metrics)
-
-        # Save results (tau2 native format)
-        mode_output = Path(config.evaluation.output).with_suffix(f".{mode}.json")
-        results.save(mode_output)
-        logger.info(f"Results saved to {mode_output}")
-
-        all_mode_results[mode] = {
-            "metrics": metrics.as_dict(),
-            "results_file": str(mode_output),
-        }
-
-    # Save combined summary
-    output_path = Path(config.evaluation.output)
-    with open(output_path, "w") as f:
-        json.dump(all_mode_results, f, indent=2, default=str)
-    logger.info(f"\nCombined summary saved to {output_path}")
-
-    # Cross-mode comparison
-    if len(modes) > 1:
-        header = f"{'Mode':<15} {'Avg Reward':<12}"
-        for k in range(1, num_trials + 1):
-            header += f" {'pass@'+str(k):<10}"
-        logger.info(f"\n--- Mode Comparison ---")
-        logger.info(header)
-        logger.info("-" * len(header))
-        for mode in modes:
-            m = all_mode_results[mode]["metrics"]
-            row = f"{mode:<15} {m['avg_reward']:<12.3f}"
-            for k in range(1, num_trials + 1):
-                key = f"pass_hat_{k}"
-                row += f" {m.get(key, 0.0):<10.3f}"
-            logger.info(row)
+    logger.info(f"Saved to {output_path}")
+    logger.info(f"Domain '{config.domain}' is now usable with tau2's task registry")
 
 
 if __name__ == "__main__":
