@@ -1,0 +1,500 @@
+"""
+Config-driven evaluation harness for deployed agents.
+
+For any new agent endpoint evaluation, write a YAML config file — zero code changes.
+The only function you need to edit is `create_user_model()` at the bottom, to
+instantiate YOUR specific LangChain-compatible model.
+
+Usage:
+    python evaluate.py --config eval_config.yaml
+    python evaluate.py --config eval_config.yaml --mode all --num-tasks 5
+
+See eval_config.example.yaml for a fully commented config template.
+"""
+
+import argparse
+import json
+import time
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import yaml
+from loguru import logger
+from pydantic import BaseModel, Field
+
+from eval_harness.endpoint_agent import (
+    EndpointAgent,
+    EndpointGTAgent,
+    EndpointSoloAgent,
+    render_template,
+)
+from eval_harness.gemini_user import GeminiUserSimulator
+from tau2.data_model.message import AssistantMessage
+from tau2.data_model.tasks import (
+    EvaluationCriteria,
+    RewardType,
+    Task,
+    UserScenario,
+)
+from tau2.environment.environment import Environment
+from tau2.orchestrator.orchestrator import Orchestrator
+
+
+# ============================================================
+# 1. CONFIG SCHEMA
+# ============================================================
+
+class EndpointConfig(BaseModel):
+    url: str
+    method: str = "POST"
+    headers: dict = Field(default_factory=dict)
+    timeout: int = 120
+    payload_template: dict = Field(default_factory=lambda: {"query": "{{query}}"})
+    response_content_key: str = "content"
+
+
+class DataConfig(BaseModel):
+    path: str
+    format: str = "excel"  # "excel" or "csv"
+    columns: dict = Field(default_factory=lambda: {
+        "question": "question",
+        "expected_answer": "expected_answer",
+        "task_id": None,
+        "user_persona": None,
+    })
+
+
+class UserSimulatorConfig(BaseModel):
+    policy: Optional[str] = None  # inline string or path to .md file
+    persona_template: str = "A customer contacting {{domain}} service."
+    instructions_template: str = (
+        "Ask the following question: {{question}}\n"
+        "Once the agent has adequately addressed your question, respond with ###STOP###.\n"
+        "If the agent asks clarifying questions, answer naturally."
+    )
+
+
+class EvaluationConfig(BaseModel):
+    modes: list[str] = Field(default_factory=lambda: ["no_user"])
+    max_steps: int = 20
+    pass_threshold: float = 0.5
+    output: str = "evaluation_results.json"
+    num_tasks: Optional[int] = None
+
+
+class OraclePlanConfig(BaseModel):
+    augmentation_template: str = (
+        "{{query}}\n\n"
+        "[Reference guidance - use this to inform your response]: {{expected_answer}}"
+    )
+
+
+class EvalConfig(BaseModel):
+    domain: str = "default"
+    endpoint: EndpointConfig
+    data: DataConfig
+    user_simulator: UserSimulatorConfig = Field(default_factory=UserSimulatorConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    oracle_plan: OraclePlanConfig = Field(default_factory=OraclePlanConfig)
+
+
+def load_config(config_path: str) -> EvalConfig:
+    with open(config_path, "r") as f:
+        raw = yaml.safe_load(f)
+    return EvalConfig(**raw)
+
+
+# ============================================================
+# 2. LOAD TASKS FROM DATA FILE
+# ============================================================
+
+def load_tasks(config: EvalConfig) -> list[Task]:
+    """Load Q&A pairs from Excel/CSV and convert to tau2 Task objects."""
+    data_cfg = config.data
+    col_map = data_cfg.columns
+
+    if data_cfg.format == "csv":
+        df = pd.read_csv(data_cfg.path)
+    else:
+        df = pd.read_excel(data_cfg.path)
+
+    question_col = col_map.get("question", "question")
+    answer_col = col_map.get("expected_answer", "expected_answer")
+    task_id_col = col_map.get("task_id")
+    persona_col = col_map.get("user_persona")
+
+    required = {question_col, answer_col}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns in data file: {missing}. Found: {list(df.columns)}")
+
+    user_cfg = config.user_simulator
+    tasks = []
+
+    for idx, row in df.iterrows():
+        question = str(row[question_col]).strip()
+        expected_answer = str(row[answer_col]).strip()
+
+        task_id = str(row[task_id_col]).strip() if task_id_col and task_id_col in df.columns else f"{config.domain}_{idx}"
+
+        template_vars = {
+            "question": question,
+            "expected_answer": expected_answer,
+            "domain": config.domain,
+        }
+
+        persona = render_template(user_cfg.persona_template, template_vars)
+        if persona_col and persona_col in df.columns:
+            persona = str(row[persona_col]).strip()
+
+        instructions = render_template(user_cfg.instructions_template, template_vars)
+
+        task = Task(
+            id=task_id,
+            user_scenario=UserScenario(
+                persona=persona,
+                instructions=instructions,
+            ),
+            ticket=question,
+            evaluation_criteria=EvaluationCriteria(
+                nl_assertions=[
+                    f"The agent's response should be consistent with: {expected_answer}"
+                ],
+                reward_basis=[RewardType.NL_ASSERTION],
+            ),
+        )
+        task.expected_answer = expected_answer
+        tasks.append(task)
+
+    logger.info(f"Loaded {len(tasks)} tasks from {data_cfg.path}")
+    return tasks
+
+
+# ============================================================
+# 3. RUN MODES
+# ============================================================
+
+def _endpoint_dict(config: EvalConfig) -> dict:
+    """Convert EndpointConfig to the dict expected by EndpointAgent."""
+    return config.endpoint.model_dump()
+
+
+def run_no_user(task: Task, config: EvalConfig) -> dict:
+    """No-User mode: question sent directly to endpoint, one-shot Q&A."""
+    agent = EndpointSoloAgent(
+        tools=[],
+        domain_policy="",
+        task=task,
+        endpoint_config=_endpoint_dict(config),
+    )
+    state = agent.get_init_state()
+    response_msg, state = agent.generate_next_message(None, state)
+    agent_response = response_msg.content.replace(EndpointSoloAgent.STOP_TOKEN, "").strip()
+
+    return {
+        "task_id": task.id,
+        "question": task.ticket,
+        "expected_answer": getattr(task, "expected_answer", ""),
+        "agent_response": agent_response,
+        "num_turns": 1,
+    }
+
+
+def run_default(task: Task, config: EvalConfig, user_model, max_steps: int) -> dict:
+    """Default mode: agent and user simulator have a multi-turn conversation."""
+    agent = EndpointAgent(
+        tools=[],
+        domain_policy="",
+        endpoint_config=_endpoint_dict(config),
+    )
+    user = GeminiUserSimulator(
+        model=user_model,
+        instructions=str(task.user_scenario),
+        policy=config.user_simulator.policy,
+    )
+    environment = Environment(
+        domain_name=config.domain,
+        policy="",
+        tools=None,
+        user_tools=None,
+    )
+
+    orchestrator = Orchestrator(
+        domain=config.domain,
+        agent=agent,
+        user=user,
+        environment=environment,
+        task=task,
+        max_steps=max_steps,
+        max_errors=5,
+        solo_mode=False,
+    )
+    simulation = orchestrator.run()
+
+    agent_responses = [
+        msg.content for msg in simulation.messages
+        if isinstance(msg, AssistantMessage) and msg.content
+    ]
+
+    return {
+        "task_id": task.id,
+        "question": task.ticket,
+        "expected_answer": getattr(task, "expected_answer", ""),
+        "agent_response": "\n".join(agent_responses),
+        "num_turns": len(simulation.messages),
+        "termination_reason": simulation.termination_reason,
+        "full_trajectory": [
+            {"role": msg.role, "content": getattr(msg, "content", "")}
+            for msg in simulation.messages
+        ],
+    }
+
+
+def run_oracle_plan(task: Task, config: EvalConfig, user_model, max_steps: int) -> dict:
+    """Oracle Plan mode: agent gets expected answer as guidance, still talks to user."""
+    agent = EndpointGTAgent(
+        tools=[],
+        domain_policy="",
+        task=task,
+        endpoint_config=_endpoint_dict(config),
+        augmentation_template=config.oracle_plan.augmentation_template,
+    )
+    user = GeminiUserSimulator(
+        model=user_model,
+        instructions=str(task.user_scenario),
+        policy=config.user_simulator.policy,
+    )
+    environment = Environment(
+        domain_name=config.domain,
+        policy="",
+        tools=None,
+        user_tools=None,
+    )
+
+    orchestrator = Orchestrator(
+        domain=config.domain,
+        agent=agent,
+        user=user,
+        environment=environment,
+        task=task,
+        max_steps=max_steps,
+        max_errors=5,
+        solo_mode=False,
+    )
+    simulation = orchestrator.run()
+
+    agent_responses = [
+        msg.content for msg in simulation.messages
+        if isinstance(msg, AssistantMessage) and msg.content
+    ]
+
+    return {
+        "task_id": task.id,
+        "question": task.ticket,
+        "expected_answer": getattr(task, "expected_answer", ""),
+        "agent_response": "\n".join(agent_responses),
+        "num_turns": len(simulation.messages),
+        "termination_reason": simulation.termination_reason,
+        "full_trajectory": [
+            {"role": msg.role, "content": getattr(msg, "content", "")}
+            for msg in simulation.messages
+        ],
+    }
+
+
+# ============================================================
+# 4. EVALUATION (LLM-as-Judge)
+# ============================================================
+
+def evaluate_response(
+    question: str,
+    expected_answer: str,
+    agent_response: str,
+    judge_model,
+) -> dict:
+    """Use the model as a judge to score agent response vs expected answer."""
+    from langchain_core.messages import HumanMessage
+
+    judge_prompt = f"""You are an evaluation judge. Compare the agent's response against
+the expected answer for the given question.
+
+Question: {question}
+
+Expected Answer: {expected_answer}
+
+Agent's Response: {agent_response}
+
+Evaluate on these criteria:
+1. Correctness: Does the response contain the key information from the expected answer?
+2. Completeness: Does the response cover all important points?
+3. Relevance: Is the response on-topic and helpful?
+
+Respond in this exact JSON format:
+{{"score": <float 0.0 to 1.0>, "reasoning": "<brief explanation>"}}
+
+Only output the JSON, nothing else."""
+
+    try:
+        response = judge_model.invoke([HumanMessage(content=judge_prompt)])
+        result_text = response.content if hasattr(response, "content") else str(response)
+        result_text = result_text.strip()
+        if result_text.startswith("```"):
+            result_text = result_text.split("```")[1]
+            if result_text.startswith("json"):
+                result_text = result_text[4:]
+        result = json.loads(result_text)
+        return {
+            "score": float(result.get("score", 0.0)),
+            "reasoning": result.get("reasoning", ""),
+        }
+    except Exception as e:
+        logger.error(f"Judge evaluation failed: {e}")
+        return {"score": 0.0, "reasoning": f"Evaluation error: {e}"}
+
+
+# ============================================================
+# 5. MODEL FACTORY — EDIT THIS FOR YOUR SETUP
+# ============================================================
+
+def create_user_model():
+    """
+    Create your LangChain-compatible model instance.
+
+    This is the ONLY function you need to edit when switching environments.
+    The model must have an `invoke(messages)` method returning an object
+    with a `.content` attribute.
+
+    Examples:
+        # LangChain Google GenAI
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+
+        # LangChain OpenAI
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model="gpt-4o")
+
+        # Your custom wrapper (must have .invoke() returning obj with .content)
+        from your_module import YourModel
+        return YourModel(...)
+    """
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    return ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+
+
+# ============================================================
+# 6. MAIN
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Config-driven evaluation harness for deployed agents"
+    )
+    parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--mode", default=None, help="Override evaluation mode(s): no_user, default, oracle_plan, all")
+    parser.add_argument("--num-tasks", type=int, default=None, help="Override number of tasks")
+    parser.add_argument("--output", default=None, help="Override output file path")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+
+    # Apply CLI overrides
+    if args.mode:
+        config.evaluation.modes = [args.mode] if args.mode != "all" else ["no_user", "default", "oracle_plan"]
+    if args.num_tasks is not None:
+        config.evaluation.num_tasks = args.num_tasks
+    if args.output:
+        config.evaluation.output = args.output
+
+    # Expand "all" mode
+    modes = config.evaluation.modes
+    if "all" in modes:
+        modes = ["no_user", "default", "oracle_plan"]
+
+    # Load tasks
+    tasks = load_tasks(config)
+    if config.evaluation.num_tasks:
+        tasks = tasks[:config.evaluation.num_tasks]
+
+    # Create model (for user simulator and judge)
+    user_model = create_user_model()
+
+    all_results = {}
+    for mode in modes:
+        logger.info(f"\n{'='*60}\nRunning mode: {mode}\n{'='*60}")
+        results = []
+
+        for i, task in enumerate(tasks):
+            logger.info(f"[{mode}] Task {i+1}/{len(tasks)}: {task.id}")
+            start = time.time()
+
+            try:
+                if mode == "no_user":
+                    result = run_no_user(task, config)
+                elif mode == "default":
+                    result = run_default(task, config, user_model, config.evaluation.max_steps)
+                elif mode == "oracle_plan":
+                    result = run_oracle_plan(task, config, user_model, config.evaluation.max_steps)
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
+                eval_result = evaluate_response(
+                    question=result["question"],
+                    expected_answer=result["expected_answer"],
+                    agent_response=result["agent_response"],
+                    judge_model=user_model,
+                )
+                result["eval_score"] = eval_result["score"]
+                result["eval_reasoning"] = eval_result["reasoning"]
+                result["duration"] = time.time() - start
+
+                logger.info(
+                    f"  Score: {eval_result['score']:.2f} | "
+                    f"Turns: {result.get('num_turns', 'N/A')} | "
+                    f"Time: {result['duration']:.1f}s"
+                )
+            except Exception as e:
+                logger.error(f"  Failed: {e}")
+                result = {
+                    "task_id": task.id,
+                    "question": task.ticket,
+                    "error": str(e),
+                    "eval_score": 0.0,
+                    "duration": time.time() - start,
+                }
+
+            results.append(result)
+
+        scores = [r["eval_score"] for r in results if "eval_score" in r]
+        threshold = config.evaluation.pass_threshold
+        summary = {
+            "mode": mode,
+            "num_tasks": len(results),
+            "avg_score": sum(scores) / len(scores) if scores else 0.0,
+            "num_passed": sum(1 for s in scores if s >= threshold),
+            "num_failed": sum(1 for s in scores if s < threshold),
+            "pass_rate": sum(1 for s in scores if s >= threshold) / len(scores) if scores else 0.0,
+        }
+        all_results[mode] = {"summary": summary, "results": results}
+
+        logger.info(f"\n--- {mode} Summary ---")
+        logger.info(f"  Average Score: {summary['avg_score']:.3f}")
+        logger.info(f"  Pass Rate:     {summary['pass_rate']:.1%} ({summary['num_passed']}/{summary['num_tasks']})")
+
+    # Save results
+    output_path = Path(config.evaluation.output)
+    with open(output_path, "w") as f:
+        json.dump(all_results, f, indent=2, default=str)
+    logger.info(f"\nResults saved to {output_path}")
+
+    if len(modes) > 1:
+        logger.info("\n--- Mode Comparison ---")
+        logger.info(f"{'Mode':<15} {'Avg Score':<12} {'Pass Rate':<12}")
+        logger.info("-" * 39)
+        for mode in modes:
+            s = all_results[mode]["summary"]
+            logger.info(f"{mode:<15} {s['avg_score']:<12.3f} {s['pass_rate']:<12.1%}")
+
+
+if __name__ == "__main__":
+    main()
