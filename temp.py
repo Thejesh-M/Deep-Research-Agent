@@ -1,407 +1,296 @@
 """
-Google ADK FastAPI Service with PyVegas Integration.
-Dynamic Agent Gateway Implementation.
+V-Support Agent: Multi-agent architecture with sub-agent transfers.
 
-UPDATED: Multi-agent sub-agent architecture with:
-- Persistent session management (conversation memory)
-- Sequential troubleshooting with fix tracking
-- Escalation logic
-- LlmProcessRequest/Response contract alignment
+Coordinator (root LlmAgent) delegates to specialist sub-agents:
+- IntentAgent: classifies intent, enforces scope guardrails
+- APIAgent: fetches product data via MCP tools
+- TroubleshootAgent: sequential KB search, one fix at a time
+- ResponseAgent: formats Slack response with confirmation prompt
+- ResolutionAgent: handles "yes it's fixed" closures
+- EscalationAgent: creates AYS tickets with context summary
+- TicketAgent: ticket status and updates
 """
 
-import os
-import yaml
-import asyncio
-import json
-import time
-from pathlib import Path
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
-from pyvegas.serve.google_adk.factory import VegasAdkApp
+from google.adk.agents import LlmAgent
 
-from google.adk.tools.mcp_tool import McpToolset
-from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPServerParams
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.genai import types
-
-from agents.slack_agent.agent import build_dynamic_agent
+GEMINI = "gemini-2.5-flash"
 
 
-# ================================================================
-# REQUEST / RESPONSE MODELS (matching api_contract.yml)
-# ================================================================
-
-class LlmProcessRequest(BaseModel):
-    sessionId: str
-    channelId: str
-    userId: str
-    appId: str
-    userMessage: str
-
-
-class LlmProcessResponse(BaseModel):
-    sessionId: str
-    finalResponse: str
-    status: str
-
-
-# ================================================================
-# GLOBAL STATE
-# ================================================================
-
-GLOBAL_STATE = {
-    "mcp_tools": [],
-    "registry": {},
-}
-
-# Persistent session service — shared across ALL requests
-# TODO: Replace with DatabaseSessionService (PostgreSQL) for UAT/PROD
-# TODO: Replace with RedisSessionService for local dev
-_SESSION_SERVICE = InMemorySessionService()
-
-# Cache runners per app_id to avoid rebuilding on every request
-_RUNNER_CACHE: dict[str, Runner] = {}
-
-_INIT_TASK = None
-
-
-# ================================================================
-# REGISTRY & INITIALIZATION
-# ================================================================
-
-def load_registry():
-    current_dir = Path(__file__).parent
-    config_path = current_dir.parent / "config" / "agents_registry.yaml"
-
-    print(f"Attempting to load registry from: {config_path.resolve()}")
-
-    if not config_path.exists():
-        raise FileNotFoundError(f"CRITICAL: Registry file not found at {config_path.resolve()}")
-
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
-
-
-async def _perform_initialization():
-    """The actual heavy lifting. Only runs exactly once."""
-    print("[Cold Start] Fetching Registry and MCP Tools...")
-
-    # 1. Load Registry
-    GLOBAL_STATE["registry"] = load_registry()
-
-    # 2. Fetch Tools
-    mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8001/mcp")
-    toolset = McpToolset(connection_params=StreamableHTTPServerParams(url=mcp_url))
-
-    GLOBAL_STATE["mcp_tools"] = await toolset.get_tools()
-    print(f"Successfully loaded {len(GLOBAL_STATE['mcp_tools'])} tools into global memory.")
-
-
-async def ensure_initialized():
+def build_dynamic_agent(app_id: str, filtered_tools: list):
     """
-    Lock-free guarantee that initialization happens once.
-    Concurrent requests will await the exact same task.
+    Build the full multi-agent hierarchy with app-specific
+    MCP tools injected into the relevant sub-agents.
+
+    Args:
+        app_id: Application identifier (e.g. "artemis")
+        filtered_tools: MCP tools filtered by allowed_catalogs
     """
-    global _INIT_TASK
 
-    if _INIT_TASK is None:
-        _INIT_TASK = asyncio.create_task(_perform_initialization())
-
-    try:
-        await _INIT_TASK
-    except Exception as e:
-        _INIT_TASK = None
-        print(f"Initialization failed: {e}")
-        raise HTTPException(status_code=503, detail="Gateway initialization failed. MCP Server may be down.")
-
-
-# ================================================================
-# APP INITIALIZATION
-# ================================================================
-
-_adk_app = VegasAdkApp(
-    agents_dir="agents",
-    web=False  # Disable standard UI as we are using webhook backend
-)
-
-app = _adk_app.create_app()
-
-pyvegas_lifespan = app.router.lifespan_context
-
-
-@asynccontextmanager
-async def combined_lifespan(fastapi_app):
-    """Executes our custom logic, then hands control back to PyVegas."""
-
-    GLOBAL_STATE["registry"] = load_registry()
-    mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8001/mcp")
-    toolset = McpToolset(connection_params=StreamableHTTPServerParams(url=mcp_url))
-
-    try:
-        GLOBAL_STATE["mcp_tools"] = await toolset.get_tools()
-        print(f"Successfully loaded {len(GLOBAL_STATE['mcp_tools'])} tools.")
-    except Exception as e:
-        print(f"Failed to load MCP tools. Error: {e}")
-
-    if pyvegas_lifespan:
-        async with pyvegas_lifespan(fastapi_app) as pyvegas_state:
-            yield pyvegas_state
-    else:
-        yield
-
-
-app.router.lifespan_context = combined_lifespan
-
-
-# ================================================================
-# HELPER: Build or retrieve a Runner for an app_id
-# ================================================================
-
-def _get_or_build_runner(app_id: str) -> Runner:
-    """
-    Build the agent + runner for a given app_id, or return
-    cached version. The agent is built with filtered MCP tools
-    based on allowed_catalogs from the registry.
-    """
-    if app_id in _RUNNER_CACHE:
-        return _RUNNER_CACHE[app_id]
-
-    registry = GLOBAL_STATE["registry"]
-    all_tools = GLOBAL_STATE["mcp_tools"]
-
-    app_config = registry.get("agents", {}).get(app_id)
-    if not app_config:
-        raise HTTPException(status_code=404, detail=f"Invalid App ID: {app_id}")
-
-    # Filter tools by allowed catalogs
-    allowed_catalogs = app_config.get("allowed_catalogs", [])
-    allowed_prefixes = [
-        registry["catalogs"][cat]
-        for cat in allowed_catalogs
-        if cat in registry.get("catalogs", {})
+    # Separate tools by purpose
+    product_api_tools = [
+        t for t in filtered_tools
+        if not t.name.startswith(("search_kb", "create_ays", "update_ays", "get_ticket"))
     ]
+    kb_tools = [t for t in filtered_tools if t.name.startswith("search_kb")]
+    ticket_create_tools = [t for t in filtered_tools if t.name.startswith("create_ays")]
+    ticket_update_tools = [t for t in filtered_tools if t.name.startswith(("update_ays", "get_ticket"))]
+    intent_tools = [t for t in filtered_tools if t.name.startswith("get_intent")]
 
-    filtered_tools = [
-        t for t in all_tools
-        if t.name.startswith(tuple(allowed_prefixes))
-    ]
+    # ─── IntentAgent ──────────────────────────────────────
+    intent_agent = LlmAgent(
+        name="IntentAgent",
+        model=GEMINI,
+        instruction=f"""You identify the user's intent for {app_id} support.
 
-    agent = build_dynamic_agent(app_id, filtered_tools)
+App: {{app_id}} | User: {{user_id}}
+User message: {{user_message}}
 
-    runner = Runner(
-        agent=agent,
-        app_name=app_id,
-        session_service=_SESSION_SERVICE,
+SCOPE GUARDRAIL: You ONLY handle IT support and troubleshooting 
+for {app_id}. If the user asks about anything outside this scope, 
+DO NOT transfer to any specialist. Respond:
+"I'm only authorized to assist with {app_id} IT support issues."
+
+SENSITIVE DATA GUARDRAIL: If the message contains passwords, 
+tokens, or credentials, respond:
+"Please avoid sharing sensitive information in this channel."
+
+Previous context:
+- Fixes attempted: {{fixes_attempted}}
+- Current step: {{current_step_index}}
+- Ticket: {{ticket_id}}
+
+WORKFLOW:
+1. Use available tools to check intent mappings if needed.
+2. Classify and transfer:
+   - New support issue needing data → transfer to APIAgent
+   - Follow-up needing more troubleshooting → transfer to TroubleshootAgent
+   - User confirms fix worked ("yes") → transfer to ResolutionAgent
+   - User rejects fix ("no") → transfer to TroubleshootAgent
+   - Ticket request or all fixes exhausted → transfer to EscalationAgent
+   - Ticket status/update inquiry → transfer to TicketAgent
+   - User asks for a human → transfer to EscalationAgent""",
+        tools=intent_tools,
+        output_key="detected_intent",
     )
 
-    _RUNNER_CACHE[app_id] = runner
-    print(f"Built and cached runner for app_id={app_id} with {len(filtered_tools)} tools.")
-    return runner
+    # ─── APIAgent ─────────────────────────────────────────
+    api_agent = LlmAgent(
+        name="APIAgent",
+        model=GEMINI,
+        instruction=f"""You fetch data from {app_id} product APIs.
 
+App: {{app_id}} | User: {{user_id}}
+Intent: {{detected_intent}}
 
-# ================================================================
-# HELPER: Get or create a session with state
-# ================================================================
+1. Use available tools to fetch API metadata and call product APIs.
+2. If the intent requires multiple APIs, call them all.
+3. NEVER include raw tokens or internal URLs in output.
 
-async def _get_or_create_session(
-    app_id: str,
-    user_id: str,
-    session_id: str,
-    channel_id: str,
-    user_message: str,
-):
-    """
-    Resume an existing session (conversation memory) or create
-    a new one with initialized state for the agent.
-
-    Session state tracks:
-    - app_id, user_id, channel_id: context identifiers
-    - user_message: current turn's message
-    - detected_intent: classified intent (persists across turns)
-    - api_results: product API response data
-    - kb_results: knowledge base search results
-    - fixes_attempted: JSON list of all fixes suggested so far
-    - current_step_index: which troubleshooting step we're on
-    - ticket_id: AYS/ServiceNow ticket ID if escalated
-    - final_response: last response given to user
-    """
-    # Try to get existing session
-    existing = await _SESSION_SERVICE.get_session(
-        app_name=app_id,
-        user_id=user_id,
-        session_id=session_id,
+After fetching data, transfer to TroubleshootAgent.""",
+        tools=product_api_tools,
+        output_key="api_results",
     )
 
-    if existing:
-        # Follow-up turn: update the message, preserve all other state
-        existing.state["user_message"] = user_message
-        return existing
+    # ─── TroubleshootAgent ────────────────────────────────
+    troubleshoot_agent = LlmAgent(
+        name="TroubleshootAgent",
+        model=GEMINI,
+        instruction=f"""You are the {app_id} troubleshooting specialist.
+You provide ONE fix at a time and track progress.
 
-    # New conversation: create session with initialized state
-    session = await _SESSION_SERVICE.create_session(
-        app_name=app_id,
-        user_id=user_id,
-        session_id=session_id,
-        state={
-            # Context
-            "app_id": app_id,
-            "user_id": user_id,
-            "channel_id": channel_id,
-            "session_id": session_id,
-            "user_message": user_message,
-            # Troubleshooting tracking
-            "detected_intent": "{}",
-            "api_results": "{}",
-            "kb_results": "",
-            "fixes_attempted": "[]",
-            "current_step_index": "1",
-            # Escalation
-            "ticket_id": "",
-            # Response
-            "final_response": "",
-            "original_message": user_message,
-        },
-    )
-    return session
+App: {{app_id}}
+User message: {{user_message}}
+API results: {{api_results}}
+Previous KB results: {{kb_results}}
+Fixes already attempted: {{fixes_attempted}}
+Current step index: {{current_step_index}}
 
+CRITICAL RULES:
+1. NEVER suggest a fix already in {{fixes_attempted}}.
+2. Suggest exactly ONE fix/step — do NOT overwhelm the user.
+3. Before the first fix, ASK if the user has already tried 
+   basic prerequisite steps.
+4. Read the KB docs and check what pre-requisite actions 
+   the resolution requires.
 
-# ================================================================
-# ENDPOINT: LLM Process (api_contract.yml aligned)
-# ================================================================
+WORKFLOW:
+1. Search the knowledge base with context about what's 
+   already been tried.
+2. Identify the NEXT logical fix not yet attempted.
+3. Transfer to ResponseAgent with the single next step.
 
-@app.post("/process", response_model=LlmProcessResponse)
-async def process_message(req: LlmProcessRequest):
-    """
-    Main entry point matching api_contract.yml.
-
-    OUTBOUND: Java calls this with LlmProcessRequest.
-    Returns LlmProcessResponse with sessionId, finalResponse, status.
-    """
-    start_total_time = time.perf_counter()
-
-    try:
-        await ensure_initialized()
-    except HTTPException as e:
-        return LlmProcessResponse(
-            sessionId=req.sessionId,
-            finalResponse="Service is temporarily unavailable. Please try again.",
-            status="error",
-        )
-
-    # 1. Get or build the runner for this app
-    try:
-        runner = _get_or_build_runner(req.appId)
-    except HTTPException as e:
-        return LlmProcessResponse(
-            sessionId=req.sessionId,
-            finalResponse=f"Configuration error: {e.detail}",
-            status="error",
-        )
-
-    # 2. Get or create session (preserves conversation history)
-    session = await _get_or_create_session(
-        app_id=req.appId,
-        user_id=req.userId,
-        session_id=req.sessionId,
-        channel_id=req.channelId,
-        user_message=req.userMessage,
+If no more relevant fixes exist in the KB, or your confidence 
+is low, transfer to EscalationAgent instead.""",
+        tools=kb_tools,
+        output_key="kb_results",
     )
 
-    # 3. Build the user message content
-    content = types.Content(
-        role="user",
-        parts=[types.Part(text=req.userMessage)]
+    # ─── ResponseAgent ────────────────────────────────────
+    response_agent = LlmAgent(
+        name="ResponseAgent",
+        model=GEMINI,
+        instruction="""You craft the final Slack response.
+
+User message: {user_message}
+Intent: {detected_intent}
+API results: {api_results}
+KB resolution: {kb_results}
+Fixes attempted: {fixes_attempted}
+Current step: {current_step_index}
+Ticket: {ticket_id}
+
+FORMAT RULES:
+- Concise — this is Slack, 2-4 sentences max
+- Present ONE fix as "Step {current_step_index}"
+- Simple, non-technical language
+
+MANDATORY ENDING for troubleshooting responses:
+"Did this resolve your issue? Please reply *Yes* or *No*."
+
+For ticket confirmations, end with:
+"Is there anything else I can help with?"
+
+NEVER include passwords, tokens, internal URLs, or raw JSON.
+
+After responding, transfer back to Coordinator.""",
+        output_key="final_response",
     )
 
-    # 4. Run the agent
-    final_response_text = "No response generated by the LLM."
+    # ─── ResolutionAgent ──────────────────────────────────
+    resolution_agent = LlmAgent(
+        name="ResolutionAgent",
+        model=GEMINI,
+        instruction="""The user confirmed their issue is resolved.
 
-    try:
-        print(f"Executing agent for {req.appId} (Session: {req.sessionId})...")
+User: {user_id} | App: {app_id}
+Fixes attempted: {fixes_attempted}
+Step that worked: {current_step_index}
 
-        start_run_time = time.perf_counter()
+Write a brief closing message:
+- Acknowledge resolution
+- Mention which step resolved it
+- Offer future help
 
-        async for event in runner.run_async(
-            user_id=req.userId,
-            session_id=req.sessionId,
-            new_message=content,
-        ):
-            if event.is_final_response():
-                final_response_text = event.content.parts[0].text
-
-        run_time = time.perf_counter() - start_run_time
-        total_time = time.perf_counter() - start_total_time
-
-        print(
-            f"Metrics | App: {req.appId} | Session: {req.sessionId} | "
-            f"LLM Run: {run_time:.4f}s | Total: {total_time:.4f}s"
-        )
-
-        return LlmProcessResponse(
-            sessionId=req.sessionId,
-            finalResponse=final_response_text,
-            status="success",
-        )
-
-    except Exception as e:
-        print(f"Agent execution failed: {e}")
-        return LlmProcessResponse(
-            sessionId=req.sessionId,
-            finalResponse=f"Failed to process request: {str(e)}",
-            status="error",
-        )
-
-
-# ================================================================
-# ENDPOINT: Legacy Slack webhook (backward compatibility)
-# ================================================================
-
-@app.post("/slack/{app_id}/events")
-@app.post("/slack/{app_id}/events/")
-async def slack_webhook(app_id: str, request: Request):
-    """
-    Legacy Slack webhook endpoint.
-    Converts Slack event payload into LlmProcessRequest
-    and delegates to process_message.
-    """
-    try:
-        await ensure_initialized()
-    except HTTPException as e:
-        return {"status": "error", "message": e.detail}
-
-    payload = await request.json()
-
-    event = payload.get("event", {})
-    user_query = event.get("text", "")
-    user_id = event.get("user", "unknown_user")
-    channel_id = event.get("channel", "unknown_channel")
-
-    # Build session_id from context (same thread = same session)
-    session_id = f"{app_id}_{channel_id}_{user_id}"
-
-    # Delegate to the contract-aligned endpoint
-    req = LlmProcessRequest(
-        sessionId=session_id,
-        channelId=channel_id,
-        userId=user_id,
-        appId=app_id,
-        userMessage=user_query,
+Transfer back to Coordinator.""",
+        output_key="final_response",
     )
 
-    response = await process_message(req)
+    # ─── EscalationAgent ──────────────────────────────────
+    escalation_agent = LlmAgent(
+        name="EscalationAgent",
+        model=GEMINI,
+        instruction="""You escalate to human support via AYS ticket.
 
-    return {
-        "status": response.status,
-        "response": response.finalResponse,
-    }
+App: {app_id} | User: {user_id}
+Intent: {detected_intent}
+API results: {api_results}
+Fixes attempted: {fixes_attempted}
 
+TRIGGERS (why you were called):
+- User explicitly requested a human
+- User rejected all suggested fixes
+- KB had no relevant documentation
+- Troubleshooting steps exhausted
 
-# ================================================================
-# DIRECT TESTING
-# ================================================================
+YOUR JOB:
+1. Generate a STRUCTURED SUMMARY:
+   - Issue: one-line from intent
+   - App: {app_id}
+   - User: {user_id}
+   - API Findings: key data from {api_results}
+   - Steps Attempted: numbered list from {fixes_attempted}
+   - Outcome per step
+   - Escalation Reason
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=1556)
+2. Call the ticket creation tool with this summary.
+
+3. Parse the response — extract the ServiceNow Ticket ID.
+
+4. Transfer to ResponseAgent to inform the user with ticket ID.
+
+NEVER include sensitive backend data in the ticket.""",
+        tools=ticket_create_tools,
+        output_key="ticket_result",
+    )
+
+    # ─── TicketAgent ──────────────────────────────────────
+    ticket_agent = LlmAgent(
+        name="TicketAgent",
+        model=GEMINI,
+        instruction="""You manage AYS ticket operations.
+
+App: {app_id} | User: {user_id}
+Known ticket: {ticket_id}
+
+A) TICKET STATUS: If user asks about status, use the 
+   status tool. Transfer to ResponseAgent.
+
+B) TICKET UPDATE: If user wants to add info or correct:
+   1. Validate inputs from the message.
+   2. Format payload for the update tool.
+   3. Call update, parse ServiceNow confirmation.
+   4. Transfer to ResponseAgent.
+
+If no {ticket_id} in state, ask user for ticket number.
+
+NEVER fabricate a ticket ID.""",
+        tools=ticket_update_tools,
+        output_key="ticket_result",
+    )
+
+    # ─── Coordinator (Root Agent) ─────────────────────────
+    coordinator = LlmAgent(
+        name="Coordinator",
+        model=GEMINI,
+        instruction=f"""You are the V-Support Coordinator for {app_id}.
+
+SCOPE: ONLY handle IT support for {app_id}.
+
+User: {{user_id}} | Session: {{session_id}}
+Fixes so far: {{fixes_attempted}}
+Current step: {{current_step_index}}
+Ticket: {{ticket_id}}
+
+YOUR SPECIALISTS:
+- IntentAgent: Identifies what the user needs
+- APIAgent: Fetches product data
+- TroubleshootAgent: Finds next fix from KB (one at a time)
+- ResponseAgent: Crafts Slack messages
+- ResolutionAgent: Handles "yes, it's fixed"
+- EscalationAgent: Creates AYS tickets
+- TicketAgent: Ticket status and updates
+
+ROUTING — assess every message and transfer:
+
+1. NEW issue or NEW action request mid-chat
+   → IntentAgent
+
+2. User says "No" / fix didn't work / still having issues
+   → TroubleshootAgent (if more fixes available)
+   → EscalationAgent (if fixes exhausted)
+
+3. User says "Yes" / resolved / thanks
+   → ResolutionAgent
+
+4. User asks for a human / wants to escalate
+   → EscalationAgent
+
+5. User asks about ticket status
+   → TicketAgent
+
+6. User wants to update/correct their ticket
+   → TicketAgent
+
+You NEVER solve issues yourself. Always delegate.""",
+        sub_agents=[
+            intent_agent,
+            api_agent,
+            troubleshoot_agent,
+            response_agent,
+            resolution_agent,
+            escalation_agent,
+            ticket_agent,
+        ],
+    )
+
+    return coordinator
